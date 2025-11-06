@@ -525,6 +525,13 @@ This tool is provided as-is for diagnostic purposes.
 
 ## Changelog
 
+### Version 1.1.1 (2025-11-06)
+- **Critical Bug Fix**: Fixed `run_find()` function that was preventing file discovery
+- Security.xml and other configuration files now properly found in all directories
+- Simplified find command exclusion logic from complex parentheses to standard prune syntax
+- Removed unused `build_find_exclude_params()` function
+- Verified fix with comprehensive testing across multiple file locations
+
 ### Version 1.1.0 (2025-11-06)
 - Added `--exclude-dirs` option to exclude directories from scanning
 - Added `--no-default-excludes` option to scan all directories

@@ -24,7 +24,7 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Script configuration
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_DIR="netcool_diagnostics_${TIMESTAMP}"
 LOG_FILE="${OUTPUT_DIR}/diagnostic_report.log"
@@ -112,40 +112,13 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-build_find_exclude_params() {
-    # Build find command exclusion parameters
-    # Returns a string of -path /dir1 -prune -o -path /dir2 -prune -o ...
-    local exclude_list="${EXCLUDE_DIRS:-$DEFAULT_EXCLUDES}"
-    local exclude_params=""
-
-    if [ -n "$exclude_list" ]; then
-        # Convert comma-separated list to array
-        IFS=',' read -ra EXCLUDED_ARRAY <<< "$exclude_list"
-
-        # Build exclusion parameters for find command
-        local first=true
-        for dir in "${EXCLUDED_ARRAY[@]}"; do
-            # Trim whitespace
-            dir=$(echo "$dir" | xargs)
-            if [ -n "$dir" ]; then
-                if [ "$first" = true ]; then
-                    exclude_params="\\( -path \"$dir\" -prune \\)"
-                    first=false
-                else
-                    exclude_params="$exclude_params -o \\( -path \"$dir\" -prune \\)"
-                fi
-            fi
-        done
-
-        if [ -n "$exclude_params" ]; then
-            echo "$exclude_params -o"
-        fi
-    fi
-}
-
 run_find() {
     # Wrapper function for find command with exclusions
     # Usage: run_find <path> <find-options>
+    # Example: run_find / -name "security.xml" -print
+    #
+    # Constructs find command with -prune exclusions:
+    # find / -path /proc -prune -o -path /sys -prune -o -name "security.xml" -print
     local search_path="$1"
     shift
     local find_options="$@"
@@ -156,23 +129,21 @@ run_find() {
         # No exclusions, run normal find
         find "$search_path" $find_options 2>/dev/null
     else
-        # Build exclusion command
+        # Build exclusion parameters
+        # Pattern: -path /dir1 -prune -o -path /dir2 -prune -o
         IFS=',' read -ra EXCLUDED_ARRAY <<< "$exclude_list"
 
         local exclude_params=""
         for dir in "${EXCLUDED_ARRAY[@]}"; do
             dir=$(echo "$dir" | xargs)
             if [ -n "$dir" ]; then
-                if [ -z "$exclude_params" ]; then
-                    exclude_params="( -path $dir -prune )"
-                else
-                    exclude_params="$exclude_params -o ( -path $dir -prune )"
-                fi
+                exclude_params="$exclude_params -path $dir -prune -o"
             fi
         done
 
         # Execute find with exclusions
-        eval find "$search_path" $exclude_params -o $find_options 2>/dev/null
+        # Final command: find <path> -path /ex1 -prune -o -path /ex2 -prune -o <options>
+        eval find "$search_path" $exclude_params $find_options 2>/dev/null
     fi
 }
 
