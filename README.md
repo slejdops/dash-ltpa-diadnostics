@@ -110,15 +110,30 @@ sudo ./netcool-diagnostics.sh
 ./netcool-diagnostics.sh [OPTIONS]
 
 OPTIONS:
-    -h, --help              Show help message
-    -v, --verbose           Enable verbose output
-    -f, --full-logs         Collect full log files (default: last 1000 lines)
-    -s, --skip-sensitive    Skip collecting sensitive information
-    --dash-home PATH        Set DASH home directory
-    --webgui-home PATH      Set WebGUI home directory
-    --jazzsm-home PATH      Set JazzSM home directory
-    --was-home PATH         Set WebSphere home directory
+    -h, --help                  Show help message
+    -v, --verbose               Enable verbose output
+    -f, --full-logs             Collect full log files (default: last 1000 lines)
+    -s, --skip-sensitive        Skip collecting sensitive information
+    --exclude-dirs DIRS         Comma-separated list of directories to exclude from scanning
+    --no-default-excludes       Don't use default directory exclusions
+    --dash-home PATH            Set DASH home directory
+    --webgui-home PATH          Set WebGUI home directory
+    --jazzsm-home PATH          Set JazzSM home directory
+    --was-home PATH             Set WebSphere home directory
 ```
+
+**Default Excluded Directories:**
+
+By default, the following directories are excluded from scanning to improve performance:
+- `/proc` - Process information
+- `/sys` - System information
+- `/dev` - Device files
+- `/run` - Runtime data
+- `/tmp` - Temporary files
+- `/var/tmp` - Temporary files
+- `/boot` - Boot files
+- `/mnt` - Mount points
+- `/media` - Removable media
 
 ### Examples
 
@@ -143,6 +158,30 @@ sudo ./netcool-diagnostics.sh \
 **Skip sensitive data:**
 ```bash
 sudo ./netcool-diagnostics.sh --skip-sensitive
+```
+
+**Exclude additional directories:**
+```bash
+# Exclude backup and archive directories
+sudo ./netcool-diagnostics.sh --exclude-dirs "/backup,/archive,/old"
+
+# Exclude home directories to focus on system files
+sudo ./netcool-diagnostics.sh --exclude-dirs "/home"
+```
+
+**Scan everything (no exclusions):**
+```bash
+# Warning: This may take a very long time and find many irrelevant files
+sudo ./netcool-diagnostics.sh --no-default-excludes
+```
+
+**Combine options:**
+```bash
+# Fast scan excluding large directories
+sudo ./netcool-diagnostics.sh \
+  --exclude-dirs "/backup,/data/archives" \
+  --skip-sensitive \
+  --verbose
 ```
 
 ## Default Paths
@@ -372,6 +411,65 @@ find / -name "ltpa.keys" 2>/dev/null
 4. **Review Regularly**: Check recommendations and implement fixes
 5. **Document Changes**: Note configuration changes and their impact
 
+## Performance Tips
+
+### Speeding Up Diagnostics
+
+The diagnostic script scans the entire filesystem by default, which can be time-consuming on large systems. Here are ways to improve performance:
+
+**1. Use Directory Exclusions**
+
+The script excludes common system directories by default (`/proc`, `/sys`, `/dev`, etc.). Add more exclusions for large, irrelevant directories:
+
+```bash
+# Exclude backup directories
+sudo ./netcool-diagnostics.sh --exclude-dirs "/backup,/archive"
+
+# Exclude multiple large directories
+sudo ./netcool-diagnostics.sh --exclude-dirs "/backup,/archive,/data/old,/mnt/storage"
+```
+
+**2. Focus on Specific Directories**
+
+If you know where your WebSphere installation is, you can significantly speed up the scan by excluding everything else:
+
+```bash
+# Only scan IBM directories (exclude most of the filesystem)
+sudo ./netcool-diagnostics.sh --exclude-dirs "/home,/var/lib,/usr/share,/usr/local"
+```
+
+**3. Skip Full Log Collection**
+
+By default, only the last 1000 lines of each log are collected. This is usually sufficient. Avoid `--full-logs` unless necessary:
+
+```bash
+# Fast scan with tail logs only (default)
+sudo ./netcool-diagnostics.sh
+```
+
+**4. Skip Sensitive Data Collection**
+
+If you don't need detailed LTPA key information:
+
+```bash
+sudo ./netcool-diagnostics.sh --skip-sensitive
+```
+
+### Typical Scan Times
+
+- **Default scan** (with exclusions): 2-5 minutes
+- **No exclusions** (`--no-default-excludes`): 10-30 minutes (depending on disk size)
+- **With additional exclusions**: 1-3 minutes
+
+### What Gets Excluded
+
+When using `--exclude-dirs`, the script will:
+- Skip searching in those directories entirely
+- Improve performance significantly
+- May miss configuration files in excluded directories
+
+**Recommendation**: Start with default exclusions, then add more if needed based on your environment.
+
 ## Security Considerations
 
 - The script collects configuration files that may contain sensitive information
@@ -426,6 +524,13 @@ If you have improvements or suggestions:
 This tool is provided as-is for diagnostic purposes.
 
 ## Changelog
+
+### Version 1.1.0 (2025-11-06)
+- Added `--exclude-dirs` option to exclude directories from scanning
+- Added `--no-default-excludes` option to scan all directories
+- Default exclusions for `/proc`, `/sys`, `/dev`, `/run`, `/tmp`, `/var/tmp`, `/boot`, `/mnt`, `/media`
+- Improved performance with selective directory scanning
+- Updated documentation with performance tips
 
 ### Version 1.0.0 (2025-11-06)
 - Initial release

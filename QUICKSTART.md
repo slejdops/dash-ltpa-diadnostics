@@ -16,6 +16,20 @@ sudo ./netcool-diagnostics.sh
 # Wait for completion (typically 2-5 minutes)
 ```
 
+### Speed Up the Scan (Optional)
+
+If the scan is taking too long, exclude large directories:
+
+```bash
+# Fast scan excluding backup/archive directories
+sudo ./netcool-diagnostics.sh --exclude-dirs "/backup,/archive,/home"
+
+# See all options
+./netcool-diagnostics.sh --help
+```
+
+**Default excluded directories:** `/proc`, `/sys`, `/dev`, `/run`, `/tmp`, `/var/tmp`, `/boot`, `/mnt`, `/media`
+
 ## 2. Review the Main Report
 
 ```bash

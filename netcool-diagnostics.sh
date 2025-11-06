@@ -24,7 +24,7 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Script configuration
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_DIR="netcool_diagnostics_${TIMESTAMP}"
 LOG_FILE="${OUTPUT_DIR}/diagnostic_report.log"
@@ -39,6 +39,11 @@ WAS_HOME="${WAS_HOME:-/opt/IBM/WebSphere/AppServer}"
 VERBOSE=0
 COLLECT_FULL_LOGS=0
 SKIP_SENSITIVE=0
+
+# Excluded directories (comma-separated list)
+EXCLUDE_DIRS=""
+# Common directories to exclude by default (can be overridden)
+DEFAULT_EXCLUDES="/proc,/sys,/dev,/run,/tmp,/var/tmp,/boot,/mnt,/media"
 
 ################################################################################
 # Utility Functions
@@ -105,6 +110,70 @@ check_root() {
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+build_find_exclude_params() {
+    # Build find command exclusion parameters
+    # Returns a string of -path /dir1 -prune -o -path /dir2 -prune -o ...
+    local exclude_list="${EXCLUDE_DIRS:-$DEFAULT_EXCLUDES}"
+    local exclude_params=""
+
+    if [ -n "$exclude_list" ]; then
+        # Convert comma-separated list to array
+        IFS=',' read -ra EXCLUDED_ARRAY <<< "$exclude_list"
+
+        # Build exclusion parameters for find command
+        local first=true
+        for dir in "${EXCLUDED_ARRAY[@]}"; do
+            # Trim whitespace
+            dir=$(echo "$dir" | xargs)
+            if [ -n "$dir" ]; then
+                if [ "$first" = true ]; then
+                    exclude_params="\\( -path \"$dir\" -prune \\)"
+                    first=false
+                else
+                    exclude_params="$exclude_params -o \\( -path \"$dir\" -prune \\)"
+                fi
+            fi
+        done
+
+        if [ -n "$exclude_params" ]; then
+            echo "$exclude_params -o"
+        fi
+    fi
+}
+
+run_find() {
+    # Wrapper function for find command with exclusions
+    # Usage: run_find <path> <find-options>
+    local search_path="$1"
+    shift
+    local find_options="$@"
+
+    local exclude_list="${EXCLUDE_DIRS:-$DEFAULT_EXCLUDES}"
+
+    if [ -z "$exclude_list" ]; then
+        # No exclusions, run normal find
+        find "$search_path" $find_options 2>/dev/null
+    else
+        # Build exclusion command
+        IFS=',' read -ra EXCLUDED_ARRAY <<< "$exclude_list"
+
+        local exclude_params=""
+        for dir in "${EXCLUDED_ARRAY[@]}"; do
+            dir=$(echo "$dir" | xargs)
+            if [ -n "$dir" ]; then
+                if [ -z "$exclude_params" ]; then
+                    exclude_params="( -path $dir -prune )"
+                else
+                    exclude_params="$exclude_params -o ( -path $dir -prune )"
+                fi
+            fi
+        done
+
+        # Execute find with exclusions
+        eval find "$search_path" $exclude_params -o $find_options 2>/dev/null
+    fi
 }
 
 ################################################################################
@@ -222,19 +291,19 @@ analyze_ltpa_configuration() {
 
         # Search for LTPA key files
         echo "=== Searching for LTPA Key Files ==="
-        find / -name "ltpa.keys" 2>/dev/null || echo "No ltpa.keys files found"
-        find / -name "*.ltpa" 2>/dev/null || echo "No .ltpa files found"
+        run_find / -name "ltpa.keys" -print || echo "No ltpa.keys files found"
+        run_find / -name "*.ltpa" -print || echo "No .ltpa files found"
         echo ""
 
         # Search for security.xml files
         echo "=== Searching for security.xml Files ==="
-        find / -name "security.xml" 2>/dev/null
+        run_find / -name "security.xml" -print
         echo ""
 
     } > "$ltpa_report"
 
     # Analyze security.xml files for LTPA configuration
-    local security_xml_files=$(find / -name "security.xml" 2>/dev/null)
+    local security_xml_files=$(run_find / -name "security.xml" -print)
 
     if [ ! -z "$security_xml_files" ]; then
         echo "=== Analyzing security.xml Files for LTPA Configuration ===" >> "$ltpa_report"
@@ -262,7 +331,7 @@ analyze_ltpa_configuration() {
 
     # Check for SSO configuration
     echo "=== SSO Configuration ===" >> "$ltpa_report"
-    find / -type f -name "*.xml" -exec grep -l "SingleSignOn\|SSO" {} \; 2>/dev/null | head -20 >> "$ltpa_report"
+    run_find / -type f -name "*.xml" -exec grep -l "SingleSignOn\|SSO" {} \; | head -20 >> "$ltpa_report"
     echo "" >> "$ltpa_report"
 
     log_message INFO "LTPA configuration analysis completed"
@@ -278,7 +347,7 @@ analyze_ltpa_keys() {
         echo ""
 
         # Find all LTPA key files
-        local ltpa_files=$(find / -name "ltpa.keys" -o -name "*.ltpa" 2>/dev/null)
+        local ltpa_files=$(run_find / \( -name "ltpa.keys" -o -name "*.ltpa" \) -print)
 
         if [ -z "$ltpa_files" ]; then
             echo "WARNING: No LTPA key files found!"
@@ -346,7 +415,7 @@ check_ltpa_cookie_configuration() {
         echo "=== Searching for Cookie Settings in Configuration Files ==="
 
         # WebSphere configuration
-        find / -name "*.xml" -type f 2>/dev/null | while read -r config_file; do
+        run_find / -name "*.xml" -type f -print | while read -r config_file; do
             if grep -qi "cookie\|ltpatoken\|session" "$config_file" 2>/dev/null; then
                 echo "File: $config_file"
                 grep -i -A 5 -B 5 "ltpatoken\|sso.*cookie\|session.*cookie" "$config_file" 2>/dev/null | head -50
@@ -356,7 +425,7 @@ check_ltpa_cookie_configuration() {
 
         echo ""
         echo "=== JVM Properties Related to Cookies ==="
-        find / -name "*.properties" -type f 2>/dev/null | while read -r prop_file; do
+        run_find / -name "*.properties" -type f -print | while read -r prop_file; do
             if grep -qi "cookie\|ltpa\|session" "$prop_file" 2>/dev/null; then
                 echo "File: $prop_file"
                 grep -i "cookie\|ltpa\|session" "$prop_file" 2>/dev/null
@@ -384,7 +453,7 @@ analyze_session_management() {
 
         # Search for session management configurations
         echo "=== Session Configuration Files ==="
-        find / -name "web.xml" -o -name "ibm-web-ext.xml" 2>/dev/null | while read -r web_xml; do
+        run_find / \( -name "web.xml" -o -name "ibm-web-ext.xml" \) -print | while read -r web_xml; do
             if [ -f "$web_xml" ]; then
                 echo "File: $web_xml"
                 if grep -qi "session" "$web_xml" 2>/dev/null; then
@@ -396,7 +465,7 @@ analyze_session_management() {
         done
 
         echo "=== Session Manager Configuration in server.xml/resources.xml ==="
-        find / -name "server.xml" -o -name "resources.xml" 2>/dev/null | while read -r xml_file; do
+        run_find / \( -name "server.xml" -o -name "resources.xml" \) -print | while read -r xml_file; do
             if [ -f "$xml_file" ]; then
                 echo "File: $xml_file"
                 if grep -qi "sessionmanager\|sessiondatabase" "$xml_file" 2>/dev/null; then
@@ -408,7 +477,7 @@ analyze_session_management() {
         done
 
         echo "=== WebSphere Session Properties ==="
-        find / -name "*.properties" -type f 2>/dev/null | while read -r prop_file; do
+        run_find / -name "*.properties" -type f -print | while read -r prop_file; do
             if grep -qi "session" "$prop_file" 2>/dev/null; then
                 echo "File: $prop_file"
                 grep -i "session" "$prop_file" 2>/dev/null | head -20
@@ -515,7 +584,7 @@ check_webgui_performance() {
 
         echo ""
         echo "=== Checking for WebGUI Cache Configuration ==="
-        find / -name "*cache*.xml" -o -name "*cache*.properties" 2>/dev/null | head -20
+        run_find / \( -name "*cache*.xml" -o -name "*cache*.properties" \) -print | head -20
 
     } > "$webgui_perf"
 
@@ -666,7 +735,7 @@ collect_configurations() {
     )
 
     for config in "${configs[@]}"; do
-        local found_files=$(find / -name "$config" 2>/dev/null | head -10)
+        local found_files=$(run_find / -name "$config" -print | head -10)
 
         if [ ! -z "$found_files" ]; then
             while IFS= read -r config_path; do
@@ -700,7 +769,7 @@ generate_diagnosis() {
         echo ""
 
         # Check for LTPA keys
-        local ltpa_keys_found=$(find / -name "ltpa.keys" -o -name "*.ltpa" 2>/dev/null | wc -l)
+        local ltpa_keys_found=$(run_find / \( -name "ltpa.keys" -o -name "*.ltpa" \) -print | wc -l)
         echo "1. LTPA Configuration:"
         if [ $ltpa_keys_found -gt 0 ]; then
             echo "   ✓ Found $ltpa_keys_found LTPA key file(s)"
@@ -828,19 +897,24 @@ Usage: $0 [OPTIONS]
 Tivoli Netcool DASH, JazzSM and WebGUI Diagnostic Script
 
 OPTIONS:
-    -h, --help              Show this help message
-    -v, --verbose           Enable verbose output
-    -f, --full-logs         Collect full log files (default: last 1000 lines)
-    -s, --skip-sensitive    Skip collecting sensitive information
-    --dash-home PATH        Set DASH home directory (default: $DASH_HOME)
-    --webgui-home PATH      Set WebGUI home directory (default: $WEBGUI_HOME)
-    --jazzsm-home PATH      Set JazzSM home directory (default: $JAZZSM_HOME)
-    --was-home PATH         Set WebSphere home directory (default: $WAS_HOME)
+    -h, --help                  Show this help message
+    -v, --verbose               Enable verbose output
+    -f, --full-logs             Collect full log files (default: last 1000 lines)
+    -s, --skip-sensitive        Skip collecting sensitive information
+    --exclude-dirs DIRS         Comma-separated list of directories to exclude from scanning
+                                (default: $DEFAULT_EXCLUDES)
+    --no-default-excludes       Don't use default directory exclusions
+    --dash-home PATH            Set DASH home directory (default: $DASH_HOME)
+    --webgui-home PATH          Set WebGUI home directory (default: $WEBGUI_HOME)
+    --jazzsm-home PATH          Set JazzSM home directory (default: $JAZZSM_HOME)
+    --was-home PATH             Set WebSphere home directory (default: $WAS_HOME)
 
 EXAMPLES:
     $0
     $0 --verbose --full-logs
     $0 --was-home /opt/IBM/WebSphere/AppServer
+    $0 --exclude-dirs "/backup,/archive,/home"
+    $0 --exclude-dirs "/large-dir" --no-default-excludes
 
 OUTPUT:
     Results will be saved to: netcool_diagnostics_<timestamp>/
@@ -852,10 +926,17 @@ FOCUS AREAS:
     - System resource utilization
     - Log analysis for errors and warnings
 
+NOTES:
+    By default, the following directories are excluded: $DEFAULT_EXCLUDES
+    Use --exclude-dirs to add additional exclusions or --no-default-excludes to scan everything.
+
 EOF
 }
 
 parse_arguments() {
+    # Initialize with default excludes
+    EXCLUDE_DIRS="$DEFAULT_EXCLUDES"
+
     while [[ $# -gt 0 ]]; do
         case $1 in
             -h|--help)
@@ -872,6 +953,19 @@ parse_arguments() {
                 ;;
             -s|--skip-sensitive)
                 SKIP_SENSITIVE=1
+                shift
+                ;;
+            --exclude-dirs)
+                # Add to existing excludes
+                if [ -z "$EXCLUDE_DIRS" ]; then
+                    EXCLUDE_DIRS="$2"
+                else
+                    EXCLUDE_DIRS="$EXCLUDE_DIRS,$2"
+                fi
+                shift 2
+                ;;
+            --no-default-excludes)
+                EXCLUDE_DIRS=""
                 shift
                 ;;
             --dash-home)
@@ -897,6 +991,11 @@ parse_arguments() {
                 ;;
         esac
     done
+
+    # Log excluded directories if verbose
+    if [ $VERBOSE -eq 1 ] && [ -n "$EXCLUDE_DIRS" ]; then
+        echo "Excluding directories: $EXCLUDE_DIRS"
+    fi
 }
 
 main() {
