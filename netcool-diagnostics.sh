@@ -14,6 +14,16 @@
 
 set -o pipefail
 
+trap 'on_exit' INT TERM EXIT
+
+on_exit() {
+    if [ -n "$OUTPUT_DIR" ] && [ -d "$OUTPUT_DIR" ]; then
+        if [ ! -f "${OUTPUT_DIR}/diagnosis_and_recommendations.txt" ]; then
+            echo "Diagnostic interrupted at $(date)" > "${OUTPUT_DIR}/diagnosis_and_recommendations.txt"
+        fi
+    fi
+}
+
 # Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -24,7 +34,7 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Script configuration
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="2.0.0"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_DIR="netcool_diagnostics_${TIMESTAMP}"
 LOG_FILE="${OUTPUT_DIR}/diagnostic_report.log"
@@ -35,6 +45,8 @@ WEBGUI_HOME="${WEBGUI_HOME:-/opt/IBM/tivoli/netcool/webgui}"
 JAZZSM_HOME="${JAZZSM_HOME:-/opt/IBM/JazzSM}"
 WAS_HOME="${WAS_HOME:-/opt/IBM/WebSphere/AppServer}"
 
+SEARCH_ROOT="/"
+
 # Flags
 VERBOSE=0
 COLLECT_FULL_LOGS=0
@@ -44,6 +56,12 @@ SKIP_SENSITIVE=0
 EXCLUDE_DIRS=""
 # Common directories to exclude by default (can be overridden)
 DEFAULT_EXCLUDES="/proc,/sys,/dev,/run,/tmp,/var/tmp,/boot,/mnt,/media"
+
+LTPA_KEY_AGE_THRESHOLD_DAYS=365
+SESSION_TIMEOUT_MIN=30
+SESSION_TIMEOUT_MAX=240
+MEMORY_USAGE_THRESHOLD=80
+NTP_OFFSET_THRESHOLD_MS=500
 
 ################################################################################
 # Utility Functions
@@ -67,8 +85,7 @@ EOF
 log_message() {
     local level=$1
     shift
-    local message="$@"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local message="$*"
 
     case $level in
         INFO)
@@ -91,8 +108,7 @@ log_message() {
 }
 
 create_output_dir() {
-    mkdir -p "${OUTPUT_DIR}"/{system_info,logs,config,performance,ltpa_analysis}
-    if [ $? -eq 0 ]; then
+    if mkdir -p "${OUTPUT_DIR}"/{system_info,logs,config,performance,ltpa_analysis}; then
         log_message INFO "Created output directory: ${OUTPUT_DIR}"
     else
         log_message ERROR "Failed to create output directory"
@@ -112,44 +128,115 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+safe_count_connections() {
+    if command_exists netstat; then
+        netstat -an 2>/dev/null | awk '/ESTABLISHED/{c++} END{print c+0}'
+    elif command_exists ss; then
+        ss -an 2>/dev/null | awk '/ESTAB/{c++} END{print c+0}'
+    else
+        echo "0"
+    fi
+}
+
+redact_sensitive() {
+    local input="$1"
+    echo "$input" | sed -E 's/(password|passphrase|secret|token|apikey|bindDNPassword)[[:space:]]*=[[:space:]]*[^[:space:]]+/\1=****/gi'
+}
+
 run_find() {
-    # Wrapper function for find command with exclusions
-    # Usage: run_find <path> <find-options>
-    # Example: run_find / -name "security.xml" -print
-    #
-    # Constructs find command with -prune exclusions:
-    # find / -path /proc -prune -o -path /sys -prune -o -name "security.xml" -print
     local search_path="$1"
     shift
-    local find_options="$@"
-
+    
     local exclude_list="${EXCLUDE_DIRS:-$DEFAULT_EXCLUDES}"
 
     if [ -z "$exclude_list" ]; then
-        # No exclusions, run normal find
-        find "$search_path" $find_options 2>/dev/null
+        find "$search_path" "$@" 2>/dev/null
     else
-        # Build exclusion parameters
-        # Pattern: -path /dir1 -prune -o -path /dir2 -prune -o
         IFS=',' read -ra EXCLUDED_ARRAY <<< "$exclude_list"
-
-        local exclude_params=""
-        for dir in "${EXCLUDED_ARRAY[@]}"; do
-            dir=$(echo "$dir" | xargs)
-            if [ -n "$dir" ]; then
-                exclude_params="$exclude_params -path $dir -prune -o"
-            fi
-        done
-
-        # Execute find with exclusions
-        # Final command: find <path> -path /ex1 -prune -o -path /ex2 -prune -o <options>
-        eval find "$search_path" $exclude_params $find_options 2>/dev/null
+        
+        local find_args=()
+        find_args+=("$search_path")
+        
+        if [ ${#EXCLUDED_ARRAY[@]} -gt 0 ]; then
+            find_args+=("(")
+            local first=1
+            for dir in "${EXCLUDED_ARRAY[@]}"; do
+                dir=$(echo "$dir" | xargs)
+                if [ -n "$dir" ]; then
+                    if [ $first -eq 1 ]; then
+                        first=0
+                    else
+                        find_args+=("-o")
+                    fi
+                    find_args+=("-path" "$dir")
+                fi
+            done
+            find_args+=(")" "-prune" "-o")
+        fi
+        
+        find_args+=("$@")
+        find_args+=("-print")
+        
+        find "${find_args[@]}" 2>/dev/null
     fi
 }
 
 ################################################################################
 # System Information Collection
 ################################################################################
+
+check_time_synchronization() {
+    log_message SECTION "TIME SYNCHRONIZATION CHECK"
+    
+    local time_sync_file="${OUTPUT_DIR}/system_info/time_synchronization.txt"
+    
+    {
+        echo "=== Time Synchronization Status ==="
+        echo "Current system time: $(date)"
+        echo ""
+        
+        if command_exists timedatectl; then
+            echo "=== timedatectl status ==="
+            timedatectl status
+            echo ""
+            
+            if timedatectl status | grep -q "System clock synchronized: yes"; then
+                echo "✓ System clock is synchronized"
+            else
+                echo "✗ WARNING: System clock is NOT synchronized"
+                echo "  This can cause LTPA token validation failures!"
+            fi
+            echo ""
+        fi
+        
+        if command_exists ntpq; then
+            echo "=== NTP Status (ntpq) ==="
+            ntpq -p 2>/dev/null || echo "ntpq query failed"
+            echo ""
+            
+            local offset=$(ntpq -c rv 2>/dev/null | grep -oP 'offset=\K[0-9.-]+' | head -1)
+            if [ -n "$offset" ]; then
+                local offset_abs=$(echo "$offset" | tr -d '-')
+                echo "NTP offset: ${offset} ms"
+                if (( $(echo "$offset_abs > $NTP_OFFSET_THRESHOLD_MS" | bc -l 2>/dev/null || echo 0) )); then
+                    echo "⚠ WARNING: NTP offset exceeds threshold (${NTP_OFFSET_THRESHOLD_MS}ms)"
+                fi
+            fi
+            echo ""
+        elif command_exists chronyc; then
+            echo "=== Chrony Status ==="
+            chronyc tracking 2>/dev/null || echo "chronyc query failed"
+            echo ""
+        else
+            echo "⚠ No NTP client detected (ntpq/chronyc not found)"
+            echo "  Clock synchronization cannot be verified"
+            echo "  RECOMMENDATION: Install and configure NTP or Chrony"
+        fi
+        
+    } > "$time_sync_file"
+    
+    log_message INFO "Time synchronization check completed: $time_sync_file"
+}
 
 collect_system_info() {
     log_message SECTION "SYSTEM INFORMATION"
@@ -274,9 +361,10 @@ analyze_ltpa_configuration() {
     } > "$ltpa_report"
 
     # Analyze security.xml files for LTPA configuration
-    local security_xml_files=$(run_find / -name "security.xml" -print)
+    local security_xml_files
+    security_xml_files=$(run_find "$SEARCH_ROOT" -name "security.xml" -type f)
 
-    if [ ! -z "$security_xml_files" ]; then
+    if [ -n "$security_xml_files" ]; then
         echo "=== Analyzing security.xml Files for LTPA Configuration ===" >> "$ltpa_report"
 
         while IFS= read -r xml_file; do
@@ -317,8 +405,8 @@ analyze_ltpa_keys() {
         echo "=== LTPA Key Files Analysis ==="
         echo ""
 
-        # Find all LTPA key files
-        local ltpa_files=$(run_find / \( -name "ltpa.keys" -o -name "*.ltpa" \) -print)
+        local ltpa_files
+        ltpa_files=$(run_find "$SEARCH_ROOT" \( -name "ltpa.keys" -o -name "*.ltpa" \) -type f)
 
         if [ -z "$ltpa_files" ]; then
             echo "WARNING: No LTPA key files found!"
@@ -327,32 +415,56 @@ analyze_ltpa_keys() {
             echo "  2. Files are in a non-standard location"
             echo "  3. Insufficient permissions to access files"
         else
+            declare -A checksum_groups
+            local file_count=0
+            
             while IFS= read -r ltpa_file; do
+                ((file_count++))
                 echo "=== File: $ltpa_file ==="
-                echo "Permissions: $(ls -l "$ltpa_file" 2>/dev/null)"
-                echo "Owner: $(stat -c '%U:%G' "$ltpa_file" 2>/dev/null)"
-                echo "Modified: $(stat -c '%y' "$ltpa_file" 2>/dev/null)"
+                
+                local perms=$(stat -c 'Mode:%A (%a) Owner:%U:%G Size:%s Modified:%y' "$ltpa_file" 2>/dev/null)
+                echo "$perms"
 
-                # Check if file is readable
                 if [ -r "$ltpa_file" ]; then
                     echo "Status: Readable"
 
-                    # Check if keys are encrypted (base64 content check)
                     if file "$ltpa_file" | grep -q "ASCII"; then
                         echo "Content Type: ASCII/Text (likely encrypted keys)"
+                        
+                        local checksum=$(sha256sum "$ltpa_file" 2>/dev/null | awk '{print $1}')
+                        if [ -n "$checksum" ]; then
+                            echo "SHA256 Checksum: $checksum"
+                            
+                            if [ -z "${checksum_groups[$checksum]}" ]; then
+                                checksum_groups[$checksum]="$ltpa_file"
+                            else
+                                checksum_groups[$checksum]="${checksum_groups[$checksum]}|$ltpa_file"
+                            fi
+                        fi
 
                         if [ $SKIP_SENSITIVE -eq 0 ]; then
-                            # Show key info without exposing actual keys
                             echo "Key entries found:"
                             grep -E "^com\.ibm\.websphere\.ltpa" "$ltpa_file" 2>/dev/null | cut -d= -f1
 
-                            # Check for important LTPA properties
                             if grep -q "com.ibm.websphere.ltpa.version" "$ltpa_file"; then
                                 echo "LTPA Version: $(grep 'com.ibm.websphere.ltpa.version' "$ltpa_file" | cut -d= -f2)"
                             fi
 
                             if grep -q "com.ibm.websphere.CreationDate" "$ltpa_file"; then
-                                echo "Creation Date: $(grep 'com.ibm.websphere.CreationDate' "$ltpa_file" | cut -d= -f2)"
+                                local creation_date=$(grep 'com.ibm.websphere.CreationDate' "$ltpa_file" | cut -d= -f2)
+                                echo "Creation Date: $creation_date"
+                                
+                                local creation_epoch=$(date -d "$creation_date" +%s 2>/dev/null)
+                                local current_epoch=$(date +%s)
+                                if [ -n "$creation_epoch" ]; then
+                                    local age_days=$(( (current_epoch - creation_epoch) / 86400 ))
+                                    echo "Key Age: $age_days days"
+                                    
+                                    if [ $age_days -gt $LTPA_KEY_AGE_THRESHOLD_DAYS ]; then
+                                        echo "⚠ WARNING: LTPA key is older than $LTPA_KEY_AGE_THRESHOLD_DAYS days"
+                                        echo "  RECOMMENDATION: Consider rotating LTPA keys"
+                                    fi
+                                fi
                             fi
 
                             if grep -q "com.ibm.websphere.CreationHost" "$ltpa_file"; then
@@ -366,6 +478,37 @@ analyze_ltpa_keys() {
 
                 echo ""
             done <<< "$ltpa_files"
+            
+            echo ""
+            echo "=== LTPA Key Checksum Analysis ==="
+            echo "Total LTPA key files found: $file_count"
+            echo "Unique key groups: ${#checksum_groups[@]}"
+            echo ""
+            
+            if [ ${#checksum_groups[@]} -gt 1 ]; then
+                echo "✗ CRITICAL: Multiple different LTPA keys detected!"
+                echo "  This will cause SSO failures when users move between servers"
+                echo ""
+                echo "Key groups by checksum:"
+                local group_num=1
+                for checksum in "${!checksum_groups[@]}"; do
+                    echo "  Group $group_num (checksum: ${checksum:0:16}...):"
+                    IFS='|' read -ra files <<< "${checksum_groups[$checksum]}"
+                    for file in "${files[@]}"; do
+                        echo "    - $file"
+                    done
+                    ((group_num++))
+                    echo ""
+                done
+                echo "ACTION REQUIRED: Synchronize LTPA keys across all servers"
+                echo "  1. Choose one key file as the master"
+                echo "  2. Export from WebSphere Admin Console"
+                echo "  3. Import to all other servers"
+                echo "  4. Restart all servers"
+            elif [ ${#checksum_groups[@]} -eq 1 ]; then
+                echo "✓ All LTPA key files have matching checksums"
+                echo "  Keys are properly synchronized across servers"
+            fi
         fi
 
     } > "$ltpa_keys_report"
@@ -422,13 +565,29 @@ analyze_session_management() {
         echo "=== Session Management Configuration ==="
         echo ""
 
-        # Search for session management configurations
+        declare -A session_timeouts
+        
         echo "=== Session Configuration Files ==="
-        run_find / \( -name "web.xml" -o -name "ibm-web-ext.xml" \) -print | while read -r web_xml; do
+        run_find "$SEARCH_ROOT" \( -name "web.xml" -o -name "ibm-web-ext.xml" \) -type f | while read -r web_xml; do
             if [ -f "$web_xml" ]; then
                 echo "File: $web_xml"
                 if grep -qi "session" "$web_xml" 2>/dev/null; then
                     grep -i -A 10 -B 2 "session-config\|session-timeout\|session-management" "$web_xml" 2>/dev/null
+                    
+                    local timeout=$(grep -oP '<session-timeout>\K[0-9]+' "$web_xml" 2>/dev/null | head -1)
+                    if [ -n "$timeout" ]; then
+                        echo "  → Session timeout detected: $timeout minutes"
+                        
+                        if [ $timeout -lt $SESSION_TIMEOUT_MIN ]; then
+                            echo "  ⚠ WARNING: Session timeout ($timeout min) is below recommended minimum ($SESSION_TIMEOUT_MIN min)"
+                            echo "    This may cause frequent user logouts"
+                        elif [ $timeout -gt $SESSION_TIMEOUT_MAX ]; then
+                            echo "  ⚠ WARNING: Session timeout ($timeout min) exceeds recommended maximum ($SESSION_TIMEOUT_MAX min)"
+                            echo "    This may pose security risks"
+                        else
+                            echo "  ✓ Session timeout is within acceptable range"
+                        fi
+                    fi
                 fi
                 echo "---"
                 echo ""
@@ -436,11 +595,15 @@ analyze_session_management() {
         done
 
         echo "=== Session Manager Configuration in server.xml/resources.xml ==="
-        run_find / \( -name "server.xml" -o -name "resources.xml" \) -print | while read -r xml_file; do
+        run_find "$SEARCH_ROOT" \( -name "server.xml" -o -name "resources.xml" \) -type f | while read -r xml_file; do
             if [ -f "$xml_file" ]; then
                 echo "File: $xml_file"
                 if grep -qi "sessionmanager\|sessiondatabase" "$xml_file" 2>/dev/null; then
                     grep -i -A 10 -B 2 "sessionmanager\|sessiondatabase\|session.*persistence" "$xml_file" 2>/dev/null
+                    
+                    if grep -qi "enable.*database.*persistence.*true" "$xml_file" 2>/dev/null; then
+                        echo "  ✓ Database persistence is enabled"
+                    fi
                 fi
                 echo "---"
                 echo ""
@@ -448,7 +611,7 @@ analyze_session_management() {
         done
 
         echo "=== WebSphere Session Properties ==="
-        run_find / -name "*.properties" -type f -print | while read -r prop_file; do
+        run_find "$SEARCH_ROOT" -name "*.properties" -type f | while read -r prop_file; do
             if grep -qi "session" "$prop_file" 2>/dev/null; then
                 echo "File: $prop_file"
                 grep -i "session" "$prop_file" 2>/dev/null | head -20
@@ -521,7 +684,7 @@ analyze_performance() {
         echo ""
 
         echo "=== Active Network Connections Count ==="
-        netstat -an 2>/dev/null | grep ESTABLISHED | wc -l || ss -an 2>/dev/null | grep ESTAB | wc -l
+        echo "Established connections: $(safe_count_connections)"
         echo ""
 
     } > "$perf_report"
@@ -577,63 +740,72 @@ collect_logs() {
         echo ""
     } > "$logs_summary"
 
-    # WebSphere logs
     if [ -d "${WAS_HOME}/profiles" ]; then
         log_message INFO "Collecting WebSphere logs..."
 
-        find "${WAS_HOME}/profiles" -name "SystemOut.log" -o -name "SystemErr.log" -o -name "ffdc" 2>/dev/null | while read -r log_path; do
+        find "${WAS_HOME}/profiles" -type f \( -name "SystemOut.log" -o -name "SystemErr.log" \) 2>/dev/null | while read -r log_path; do
             echo "Found: $log_path" >> "$logs_summary"
 
             if [ $COLLECT_FULL_LOGS -eq 1 ]; then
                 cp "$log_path" "${OUTPUT_DIR}/logs/" 2>/dev/null
             else
-                # Collect last 1000 lines
-                tail -1000 "$log_path" > "${OUTPUT_DIR}/logs/$(basename $log_path).tail" 2>/dev/null
+                tail -1000 "$log_path" > "${OUTPUT_DIR}/logs/$(basename "$log_path").tail" 2>/dev/null
+            fi
+        done
+        
+        find "${WAS_HOME}/profiles" -type d -name "ffdc" 2>/dev/null | while read -r ffdc_dir; do
+            echo "Found FFDC directory: $ffdc_dir" >> "$logs_summary"
+            local ffdc_basename=$(basename "$(dirname "$ffdc_dir")")_ffdc
+            
+            if [ $COLLECT_FULL_LOGS -eq 1 ]; then
+                cp -r "$ffdc_dir" "${OUTPUT_DIR}/logs/${ffdc_basename}" 2>/dev/null
+            else
+                mkdir -p "${OUTPUT_DIR}/logs/${ffdc_basename}" 2>/dev/null
+                find "$ffdc_dir" -type f -name "*.log" -o -name "*.txt" 2>/dev/null | head -10 | while read -r ffdc_file; do
+                    tail -500 "$ffdc_file" > "${OUTPUT_DIR}/logs/${ffdc_basename}/$(basename "$ffdc_file").tail" 2>/dev/null
+                done
             fi
         done
     fi
 
-    # JazzSM logs
     if [ -d "${JAZZSM_HOME}" ]; then
         log_message INFO "Collecting JazzSM logs..."
 
-        find "${JAZZSM_HOME}" -name "*.log" 2>/dev/null | head -20 | while read -r log_path; do
+        find "${JAZZSM_HOME}" -type f -name "*.log" 2>/dev/null | head -20 | while read -r log_path; do
             echo "Found: $log_path" >> "$logs_summary"
 
             if [ $COLLECT_FULL_LOGS -eq 1 ]; then
                 cp "$log_path" "${OUTPUT_DIR}/logs/" 2>/dev/null
             else
-                tail -1000 "$log_path" > "${OUTPUT_DIR}/logs/$(basename $log_path).tail" 2>/dev/null
+                tail -1000 "$log_path" > "${OUTPUT_DIR}/logs/$(basename "$log_path").tail" 2>/dev/null
             fi
         done
     fi
 
-    # DASH logs
     if [ -d "${DASH_HOME}" ]; then
         log_message INFO "Collecting DASH logs..."
 
-        find "${DASH_HOME}" -name "*.log" 2>/dev/null | head -20 | while read -r log_path; do
+        find "${DASH_HOME}" -type f -name "*.log" 2>/dev/null | head -20 | while read -r log_path; do
             echo "Found: $log_path" >> "$logs_summary"
 
             if [ $COLLECT_FULL_LOGS -eq 1 ]; then
                 cp "$log_path" "${OUTPUT_DIR}/logs/" 2>/dev/null
             else
-                tail -1000 "$log_path" > "${OUTPUT_DIR}/logs/$(basename $log_path).tail" 2>/dev/null
+                tail -1000 "$log_path" > "${OUTPUT_DIR}/logs/$(basename "$log_path").tail" 2>/dev/null
             fi
         done
     fi
 
-    # WebGUI logs
     if [ -d "${WEBGUI_HOME}" ]; then
         log_message INFO "Collecting WebGUI logs..."
 
-        find "${WEBGUI_HOME}" -name "*.log" 2>/dev/null | head -20 | while read -r log_path; do
+        find "${WEBGUI_HOME}" -type f -name "*.log" 2>/dev/null | head -20 | while read -r log_path; do
             echo "Found: $log_path" >> "$logs_summary"
 
             if [ $COLLECT_FULL_LOGS -eq 1 ]; then
                 cp "$log_path" "${OUTPUT_DIR}/logs/" 2>/dev/null
             else
-                tail -1000 "$log_path" > "${OUTPUT_DIR}/logs/$(basename $log_path).tail" 2>/dev/null
+                tail -1000 "$log_path" > "${OUTPUT_DIR}/logs/$(basename "$log_path").tail" 2>/dev/null
             fi
         done
     fi
@@ -871,7 +1043,9 @@ OPTIONS:
     -h, --help                  Show this help message
     -v, --verbose               Enable verbose output
     -f, --full-logs             Collect full log files (default: last 1000 lines)
-    -s, --skip-sensitive        Skip collecting sensitive information
+    -s, --skip-sensitive        Skip collecting sensitive information (enables redaction)
+    --output-dir PATH           Set custom output directory (default: netcool_diagnostics_<timestamp>)
+    --root PATH                 Limit filesystem search to specific root path (default: /)
     --exclude-dirs DIRS         Comma-separated list of directories to exclude from scanning
                                 (default: $DEFAULT_EXCLUDES)
     --no-default-excludes       Don't use default directory exclusions
@@ -885,27 +1059,30 @@ EXAMPLES:
     $0 --verbose --full-logs
     $0 --was-home /opt/IBM/WebSphere/AppServer
     $0 --exclude-dirs "/backup,/archive,/home"
+    $0 --root /opt/IBM --output-dir /tmp/diagnostics
     $0 --exclude-dirs "/large-dir" --no-default-excludes
 
 OUTPUT:
     Results will be saved to: netcool_diagnostics_<timestamp>/
+    Or custom directory specified with --output-dir
 
 FOCUS AREAS:
-    - LTPA Token configuration and issues
-    - User session management
+    - LTPA Token configuration and issues (with checksum analysis)
+    - User session management (with timeout policy checks)
     - GUI performance analysis
     - System resource utilization
+    - Time synchronization (NTP/Chrony)
     - Log analysis for errors and warnings
 
 NOTES:
     By default, the following directories are excluded: $DEFAULT_EXCLUDES
     Use --exclude-dirs to add additional exclusions or --no-default-excludes to scan everything.
+    Use --root to limit scanning to a specific directory for faster diagnostics or testing.
 
 EOF
 }
 
 parse_arguments() {
-    # Initialize with default excludes
     EXCLUDE_DIRS="$DEFAULT_EXCLUDES"
 
     while [[ $# -gt 0 ]]; do
@@ -926,8 +1103,16 @@ parse_arguments() {
                 SKIP_SENSITIVE=1
                 shift
                 ;;
+            --output-dir)
+                OUTPUT_DIR="$2"
+                LOG_FILE="${OUTPUT_DIR}/diagnostic_report.log"
+                shift 2
+                ;;
+            --root)
+                SEARCH_ROOT="$2"
+                shift 2
+                ;;
             --exclude-dirs)
-                # Add to existing excludes
                 if [ -z "$EXCLUDE_DIRS" ]; then
                     EXCLUDE_DIRS="$2"
                 else
@@ -963,9 +1148,9 @@ parse_arguments() {
         esac
     done
 
-    # Log excluded directories if verbose
-    if [ $VERBOSE -eq 1 ] && [ -n "$EXCLUDE_DIRS" ]; then
-        echo "Excluding directories: $EXCLUDE_DIRS"
+    if [ $VERBOSE -eq 1 ]; then
+        [ -n "$EXCLUDE_DIRS" ] && echo "Excluding directories: $EXCLUDE_DIRS"
+        [ "$SEARCH_ROOT" != "/" ] && echo "Search root limited to: $SEARCH_ROOT"
     fi
 }
 
@@ -978,30 +1163,24 @@ main() {
 
     check_root
 
-    # Execute all diagnostic functions
     collect_system_info
+    check_time_synchronization
     check_processes
 
-    # LTPA Token Analysis
     analyze_ltpa_configuration
     analyze_ltpa_keys
     check_ltpa_cookie_configuration
 
-    # Session Management
     analyze_session_management
 
-    # Performance Analysis
     analyze_performance
     check_webgui_performance
 
-    # Log Collection and Analysis
     collect_logs
     analyze_logs_for_errors
 
-    # Configuration Collection
     collect_configurations
 
-    # Generate final diagnosis
     generate_diagnosis
 
     echo ""
@@ -1010,7 +1189,6 @@ main() {
     log_message INFO "Main report: ${OUTPUT_DIR}/diagnosis_and_recommendations.txt"
     echo ""
 
-    # Create archive
     log_message INFO "Creating archive..."
     tar -czf "${OUTPUT_DIR}.tar.gz" "${OUTPUT_DIR}" 2>/dev/null
     if [ $? -eq 0 ]; then

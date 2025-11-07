@@ -525,6 +525,49 @@ This tool is provided as-is for diagnostic purposes.
 
 ## Changelog
 
+### Version 2.0.0 (2025-11-07)
+- **Major Enhancement Release**: Comprehensive improvements and new diagnostic capabilities
+- **Fixed `run_find()` function**: Removed eval, now uses proper arrays for safer execution
+- **LTPA Key Checksum Analysis**: Automatically detects and groups LTPA keys by SHA256 checksum
+  - Identifies key mismatches across servers that cause SSO failures
+  - Provides detailed synchronization recommendations
+  - Detects stale keys (>365 days old by default)
+- **Time Synchronization Check**: New NTP/Chrony status verification
+  - Detects clock skew that causes LTPA validation failures
+  - Supports timedatectl, ntpq, and chronyc
+  - Configurable offset threshold (default: 500ms)
+- **Session Timeout Policy Checks**: Automatic validation against configurable thresholds
+  - Flags timeouts below 30 minutes (frequent logouts)
+  - Flags timeouts above 240 minutes (security risk)
+  - Extracts and analyzes session-timeout values from web.xml
+- **Improved Log Collection**: Fixed ffdc directory handling
+  - Properly copies ffdc directories recursively
+  - Separates file and directory handling
+  - Prevents "Is a directory" errors
+- **New CLI Options**:
+  - `--output-dir PATH`: Specify custom output directory
+  - `--root PATH`: Limit filesystem search for faster diagnostics and testing
+- **Enhanced Error Handling**:
+  - Added trap for cleanup on interruption
+  - Improved connection counting (safe_count_connections)
+  - Better command availability detection
+- **Redaction Framework**: Enhanced --skip-sensitive mode
+  - Redacts passwords, secrets, tokens in configurations
+  - Safer for automated/scheduled runs
+- **Test Harness**: New fixture-based test suite in tests/run_tests.sh
+  - 7 comprehensive tests covering all major features
+  - Validates LTPA detection, session analysis, log collection
+  - Enables regression testing
+- **Code Quality Improvements**:
+  - Fixed critical shellcheck warnings
+  - Improved quoting and variable handling
+  - Better separation of concerns
+- **Policy Thresholds**: Configurable via script variables
+  - LTPA_KEY_AGE_THRESHOLD_DAYS (default: 365)
+  - SESSION_TIMEOUT_MIN (default: 30)
+  - SESSION_TIMEOUT_MAX (default: 240)
+  - NTP_OFFSET_THRESHOLD_MS (default: 500)
+
 ### Version 1.1.1 (2025-11-06)
 - **Critical Bug Fix**: Fixed `run_find()` function that was preventing file discovery
 - Security.xml and other configuration files now properly found in all directories
